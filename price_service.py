@@ -1,55 +1,82 @@
 import logging
+from dataclasses import dataclass
+
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Bybit V5 endpoint для получения тикеров
 BYBIT_URL = "https://api.bybit.com/v5/market/tickers"
+TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
-async def fetch_prices(symbols: list[str]) -> dict[str, float]:
-    """Возвращает {symbol: price}. symbols — тикеры Bybit, напр. 'BTCUSDT', 'GRAMUSDT'."""
-    if not symbols:
-        return {}
+@dataclass(frozen=True)
+class Ticker:
+    price: float
+    turnover24h: float     # оборот за 24ч в валюте котировки (для BTCUSDT — в USDT)
+    change24h_pct: float   # изменение за 24ч, в процентах
 
-    result: dict[str, float] = {}
-    async with aiohttp.ClientSession() as session:
-        for symbol in symbols:
-            try:
-                # Bybit требует указать категорию, для спота это "spot"
-                async with session.get(
-                    BYBIT_URL, 
-                    params={"category": "spot", "symbol": symbol}, 
-                    timeout=10
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Структура ответа Bybit: result -> list -> [0] -> lastPrice
-                        if data.get("retCode") == 0:
-                            ticker_list = data.get("result", {}).get("list", [])
-                            if ticker_list:
-                                price = ticker_list[0].get("lastPrice")
-                                if price:
-                                    result[symbol] = float(price)
-                    else:
-                        logger.warning(f"Bybit вернул {resp.status} для {symbol}")
-            except Exception as e:
-                logger.warning(f"Ошибка получения цены {symbol} с Bybit: {e}")
+
+def fmt_price(price: float) -> str:
+    """Красивый вывод числа: без экспоненты и без лишних нулей."""
+    text = f"{price:.4f}" if abs(price) >= 1 else f"{price:.8f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _f(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _get_tickers(category: str, symbol: str | None = None) -> list[dict]:
+    params = {"category": category}
+    if symbol:
+        params["symbol"] = symbol
+    async with aiohttp.ClientSession(timeout=TIMEOUT) as session:
+        async with session.get(BYBIT_URL, params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error: {data.get('retMsg')}")
+    return data.get("result", {}).get("list", [])
+
+
+async def fetch_spot() -> dict[str, Ticker]:
+    """Все спот-пары одним запросом: цена, оборот за 24ч, изменение за 24ч."""
+    result: dict[str, Ticker] = {}
+    for t in await _get_tickers("spot"):
+        price = _f(t.get("lastPrice"))
+        if not price:
+            continue
+        result[t["symbol"]] = Ticker(
+            price=price,
+            turnover24h=_f(t.get("turnover24h")) or 0.0,
+            change24h_pct=(_f(t.get("price24hPcnt")) or 0.0) * 100,
+        )
     return result
 
 
-async def validate_symbol(symbol: str) -> bool:
-    """Проверяет, существует ли торговая пара на Bybit (спот)."""
+async def fetch_funding() -> dict[str, float]:
+    """Ставки фандинга бессрочных контрактов (linear) в ПРОЦЕНТАХ, одним запросом."""
+    result: dict[str, float] = {}
+    for t in await _get_tickers("linear"):
+        rate = _f(t.get("fundingRate"))
+        if rate is not None:
+            result[t["symbol"]] = rate * 100
+    return result
+
+
+async def validate_symbol(symbol: str, kind: str = "price") -> bool:
+    """Есть ли пара на Bybit: спот для price/pct/volume, бессрочный контракт для funding."""
+    category = "linear" if kind == "funding" else "spot"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                BYBIT_URL, 
-                params={"category": "spot", "symbol": symbol}, 
-                timeout=10
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("retCode") == 0 and len(data.get("result", {}).get("list", [])) > 0
-                return False
-    except Exception:
+        items = await _get_tickers(category, symbol)
+    except Exception as e:
+        logger.warning("Ошибка проверки пары %s: %s", symbol, e)
         return False
+    if not items:
+        return False
+    if kind == "funding":
+        return _f(items[0].get("fundingRate")) is not None
+    return True
