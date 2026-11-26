@@ -1,9 +1,10 @@
+import html
 import time
 from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
@@ -20,8 +21,10 @@ from alert_types import (
     PREMIUM_KINDS,
     allowed_alert_ids,
     describe_alert,
+    format_symbol_info,
     parse_number,
 )
+from command_parser import ParseError, parse_alert_command
 from config import (
     FREE_ALERT_LIMIT,
     PREMIUM_ALERT_LIMIT,
@@ -37,10 +40,12 @@ from keyboards import (
     main_kb,
     pay_kb,
     pay_link_kb,
+    sub_kb,
     window_kb,
 )
-from price_service import validate_symbol
+from price_service import fmt_price, get_symbol_info, resolve_symbol
 from states import AlertForm
+from subscription import missing_channels
 from storage import (
     Alert,
     add_alert,
@@ -56,6 +61,19 @@ from storage import (
 router = Router()
 
 PREMIUM_PAYLOAD = "premium_sub_30d"
+
+ALERT_USAGE = (
+    "<b>Быстро — командой:</b>\n"
+    "<code>/alert BTC &gt; 70000</code> — цена выше\n"
+    "<code>/alert BTC &lt; 60k</code> — цена ниже\n"
+    "<code>/alert BTC 70000</code> — направление определю сам\n\n"
+    "<b>Премиум:</b>\n"
+    "<code>/alert ETH +5% 1h</code> — рост на 5% за час\n"
+    "<code>/alert ETH -3% 15m</code> — падение на 3% за 15 мин\n"
+    "<code>/alert BTC vol &gt; 50m</code> — объём за 24ч\n"
+    "<code>/alert BTC fund &gt; 0.05</code> — фандинг, %\n\n"
+    "Периоды: 5m, 15m, 1h, 24h. Тикер можно без USDT."
+)
 
 FEATURES_TEXT = (
     f"• до {PREMIUM_ALERT_LIMIT} алертов вместо {FREE_ALERT_LIMIT}\n"
@@ -76,6 +94,100 @@ async def _paywall(message: Message, text: str) -> None:
     )
 
 
+async def _missing_for(bot, user_id: int):
+    """Каналы-партнёры, на которые нужно подписаться. Премиум-пользователей не просим."""
+    if await is_user_premium(user_id):
+        return []
+    return await missing_channels(bot, user_id)
+
+
+async def _ask_to_subscribe(target: Message, channels) -> None:
+    await target.answer(
+        "Чтобы создавать алерты, подпишись на каналы наших партнёров 👇\n"
+        "Потом нажми «Я подписался».\n\n"
+        "<i>С премиумом подписка на каналы не требуется.</i>",
+        reply_markup=sub_kb(channels),
+    )
+
+
+async def _open_kind_menu(target: Message, user_id: int, state: FSMContext) -> None:
+    premium = await is_user_premium(user_id)
+    if premium and await count_user_alerts(user_id) >= PREMIUM_ALERT_LIMIT:
+        await target.answer(f"Достигнут максимум: {PREMIUM_ALERT_LIMIT} алертов. Удали ненужные.")
+        return
+    await state.set_state(AlertForm.waiting_kind)
+    await target.answer("Какой алерт создаём?", reply_markup=kind_kb(premium))
+
+
+async def _create_from_command(
+    target: Message, user_id: int, args: str, state: FSMContext
+) -> None:
+    """Создаёт алерт из текста команды. Те же проверки, что и в кнопочном сценарии."""
+    try:
+        parsed = parse_alert_command(args)
+    except ParseError as e:
+        await target.answer(f"⚠️ {html.escape(str(e))}\n\n{ALERT_USAGE}")
+        return
+
+    missing = await _missing_for(target.bot, user_id)
+    if missing:
+        # запомним команду: после подписки выполним её сами
+        await state.update_data(pending_alert=args)
+        await _ask_to_subscribe(target, missing)
+        return
+
+    premium = await is_user_premium(user_id)
+    if parsed.kind in PREMIUM_KINDS and not premium:
+        await _paywall(target, "🔒 Этот тип алерта доступен в премиуме.")
+        return
+    if premium:
+        if await count_user_alerts(user_id) >= PREMIUM_ALERT_LIMIT:
+            await target.answer(f"Достигнут максимум: {PREMIUM_ALERT_LIMIT} алертов. Удали ненужные.")
+            return
+    elif await count_user_alerts(user_id, KIND_PRICE) >= FREE_ALERT_LIMIT:
+        await _paywall(target, f"Бесплатный лимит исчерпан: {FREE_ALERT_LIMIT} алерта.")
+        return
+
+    resolved = await resolve_symbol(parsed.symbol, parsed.kind)
+    if resolved is None:
+        where = "среди бессрочных контрактов" if parsed.kind == KIND_FUNDING else "на Bybit (спот)"
+        await target.answer(
+            f"Пара <code>{html.escape(parsed.symbol)}</code> не найдена {where}.\n"
+            "Проверь тикер, например <code>BTC</code> или <code>ETHUSDT</code>."
+        )
+        return
+    symbol, price = resolved
+
+    direction = parsed.direction
+    note = ""
+    if parsed.kind == KIND_PRICE:
+        if direction is None:  # "/alert BTC 70000": сравниваем с текущей ценой
+            if parsed.threshold == price:
+                await target.answer("Цена сейчас ровно такая — укажи другой уровень.")
+                return
+            direction = "above" if parsed.threshold > price else "below"
+        already = price > parsed.threshold if direction == "above" else price < parsed.threshold
+        if already:
+            note = "\n⚠️ Условие уже выполняется — алерт сработает в ближайшие секунды."
+
+    alert = Alert(
+        id=None,
+        user_id=user_id,
+        chat_id=target.chat.id,
+        symbol=symbol,
+        threshold=parsed.threshold,
+        direction=direction,
+        kind=parsed.kind,
+        window_sec=parsed.window_sec,
+    )
+    alert_id = await add_alert(alert)
+    price_line = f"\nСейчас {symbol}: {fmt_price(price)}" if price is not None else ""
+    await target.answer(
+        f"✅ Алерт создан:\n{describe_alert(alert)}{price_line}{note}",
+        reply_markup=alert_item_kb(alert_id),
+    )
+
+
 # ВАЖНО: обработчики кнопок меню стоят ВЫШЕ обработчиков FSM-шагов,
 # чтобы нажатие кнопки в середине диалога не воспринималось как тикер/число.
 # Каждый из них сбрасывает состояние.
@@ -90,6 +202,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(Command("help"))
 @router.message(F.text == "ℹ️ Помощь")
 async def help_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -105,7 +218,8 @@ async def help_handler(message: Message, state: FSMContext) -> None:
         "• 💸 Фандинг — премиум\n\n"
         "Тикер — спот-пара, как на Bybit (для фандинга — бессрочный контракт). "
         "Цена указывается в валюте котировки, для BTCUSDT это USDT.\n\n"
-        f"Премиум: {PREMIUM_PRICE_STARS} ⭐ в месяц, кнопка «⭐ Премиум».",
+        f"Премиум: {PREMIUM_PRICE_STARS} ⭐ в месяц, кнопка «⭐ Премиум».\n\n"
+        + ALERT_USAGE,
         reply_markup=main_kb,
     )
 
@@ -114,16 +228,45 @@ async def help_handler(message: Message, state: FSMContext) -> None:
 async def start_create(message: Message, state: FSMContext) -> None:
     await state.clear()
     user_id = message.from_user.id
-    premium = await is_user_premium(user_id)
 
-    if premium and await count_user_alerts(user_id) >= PREMIUM_ALERT_LIMIT:
-        await message.answer(f"Достигнут максимум: {PREMIUM_ALERT_LIMIT} алертов. Удали ненужные.")
+    missing = await _missing_for(message.bot, user_id)
+    if missing:
+        await _ask_to_subscribe(message, missing)
         return
 
-    await state.set_state(AlertForm.waiting_kind)
-    await message.answer("Какой алерт создаём?", reply_markup=kind_kb(premium))
+    await _open_kind_menu(message, user_id, state)
 
 
+@router.callback_query(F.data == "check_sub")
+async def check_subscription(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    missing = await _missing_for(callback.bot, user_id)
+    if missing:
+        names = ", ".join(c.title for c in missing)
+        await callback.answer(f"Ты ещё не подписан на: {names}", show_alert=True)
+        return
+
+    pending = (await state.get_data()).get("pending_alert")
+    await callback.message.edit_text("✅ Спасибо за подписку!")
+    if pending:
+        await state.clear()
+        await _create_from_command(callback.message, user_id, pending, state)
+    else:
+        await _open_kind_menu(callback.message, user_id, state)
+    await callback.answer()
+
+
+@router.message(Command("alert", "a"))
+async def cmd_alert(message: Message, command: CommandObject, state: FSMContext) -> None:
+    await state.clear()
+    args = (command.args or "").strip()
+    if not args:
+        await message.answer(ALERT_USAGE)
+        return
+    await _create_from_command(message, message.from_user.id, args, state)
+
+
+@router.message(Command("alerts"))
 @router.message(F.text == "📋 Мои алерты")
 async def list_alerts(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -156,6 +299,7 @@ async def delete_all(message: Message, state: FSMContext) -> None:
     await message.answer(f"Удалено алертов: {deleted}")
 
 
+@router.message(Command("premium"))
 @router.message(F.text == "⭐ Премиум")
 async def premium_info(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -235,7 +379,8 @@ async def got_symbol(message: Message, state: FSMContext) -> None:
         )
         return
 
-    if not await validate_symbol(symbol, kind):
+    info = await get_symbol_info(symbol, kind)
+    if info is None:
         where = "среди бессрочных контрактов Bybit" if kind == KIND_FUNDING else "на Bybit (спот)"
         await message.answer(
             f"Пара <code>{symbol}</code> не найдена {where}.\n"
@@ -247,7 +392,7 @@ async def got_symbol(message: Message, state: FSMContext) -> None:
     await state.set_state(AlertForm.waiting_direction)
     question = "Какое движение отслеживаем?" if kind == KIND_PCT else "Когда присылать алерт?"
     await message.answer(
-        f"Пара: <b>{symbol}</b>\n{question}",
+        f"{format_symbol_info(symbol, kind, info)}\n\n{question}",
         reply_markup=direction_kb(kind),
     )
 
@@ -273,6 +418,15 @@ def _value_prompt(kind: str, direction: str) -> str:
     return f"Пришли, когда цена будет <b>{word}</b> какой суммы (в USDT)?"
 
 
+async def _value_prompt_with_info(data: dict, kind: str, direction: str) -> str:
+    """Вопрос про значение + свежая текущая цена (если Bybit ответил)."""
+    prompt = _value_prompt(kind, direction)
+    info = await get_symbol_info(data["symbol"], kind)
+    if info is None:
+        return prompt
+    return f"{format_symbol_info(data['symbol'], kind, info)}\n\n{prompt}"
+
+
 @router.callback_query(AlertForm.waiting_direction, F.data.startswith("dir:"))
 async def got_direction(callback: CallbackQuery, state: FSMContext) -> None:
     direction = callback.data.split(":")[1]
@@ -285,7 +439,8 @@ async def got_direction(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.edit_text("За какой период считаем изменение?", reply_markup=window_kb())
     else:
         await state.set_state(AlertForm.waiting_value)
-        await callback.message.edit_text(_value_prompt(kind, direction), reply_markup=cancel_kb())
+        text = await _value_prompt_with_info(data, kind, direction)
+        await callback.message.edit_text(text, reply_markup=cancel_kb())
     await callback.answer()
 
 
@@ -295,9 +450,8 @@ async def got_window(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await state.update_data(window_sec=window)
     await state.set_state(AlertForm.waiting_value)
-    await callback.message.edit_text(
-        _value_prompt(KIND_PCT, data["direction"]), reply_markup=cancel_kb()
-    )
+    text = await _value_prompt_with_info(data, KIND_PCT, data["direction"])
+    await callback.message.edit_text(text, reply_markup=cancel_kb())
     await callback.answer()
 
 
@@ -341,6 +495,15 @@ async def got_value(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(AlertForm.waiting_confirm, F.data == "confirm")
 async def confirm_alert(callback: CallbackQuery, state: FSMContext) -> None:
+    # повторная проверка: подписку могли снять, пока человек заполнял форму
+    missing = await _missing_for(callback.bot, callback.from_user.id)
+    if missing:
+        await state.clear()
+        await callback.message.edit_text("Подписка на каналы партнёров не найдена.")
+        await _ask_to_subscribe(callback.message, missing)
+        await callback.answer()
+        return
+
     data = await state.get_data()
     await state.clear()
 

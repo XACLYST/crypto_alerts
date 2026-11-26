@@ -94,3 +94,19 @@ def allowed_alert_ids(alerts, premium_user_ids: set[int]) -> set[int]:
             used[a.user_id] = used.get(a.user_id, 0) + 1
             allowed.add(a.id)
     return allowed
+
+
+_QUOTES = ("USDT", "USDC", "EUR", "DAI", "BTC", "ETH")
+
+
+def format_symbol_info(symbol: str, kind: str, info) -> str:
+    """Текст «текущая цена» для сообщений при создании алерта (HTML)."""
+    quote = next((q for q in _QUOTES if symbol.endswith(q)), "")
+    lines = [f"Текущая цена {symbol}: <b>{fmt_price(info.price)}</b> {quote}".rstrip()]
+    if kind == KIND_PCT and info.change24h_pct is not None:
+        lines.append(f"За 24ч: {info.change24h_pct:+.2f}%")
+    if kind == KIND_VOLUME and info.turnover24h is not None:
+        lines.append(f"Объём за 24ч: <b>{fmt_big(info.turnover24h)}</b> {quote}".rstrip())
+    if kind == KIND_FUNDING and info.funding is not None:
+        lines.append(f"Фандинг сейчас: <b>{info.funding:+.4f}%</b>")
+    return "\n".join(lines)

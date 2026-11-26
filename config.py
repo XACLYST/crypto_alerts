@@ -19,7 +19,7 @@ FREE_ALERT_LIMIT = 2
 PREMIUM_ALERT_LIMIT = 50
 
 # подписка в Telegram Stars (списывается раз в 30 дней)
-PREMIUM_PRICE_STARS = 100  # подбери цену сам
+PREMIUM_PRICE_STARS = 1  # подбери цену сам
 SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # Telegram разрешает только 30 дней
 
 # --- повторное "взведение" сработавшего алерта ---

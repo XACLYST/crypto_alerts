@@ -94,3 +94,9 @@ def alert_item_kb(alert_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{alert_id}")]
         ]
     )
+
+
+def sub_kb(channels) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=f"📢 {c.title}", url=c.url)] for c in channels]
+    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

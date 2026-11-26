@@ -16,6 +16,15 @@ class Ticker:
     change24h_pct: float   # изменение за 24ч, в процентах
 
 
+@dataclass(frozen=True)
+class SymbolInfo:
+    """Текущие данные по одной паре — чтобы показать их при создании алерта."""
+    price: float
+    change24h_pct: float | None = None   # спот
+    turnover24h: float | None = None     # спот, в валюте котировки
+    funding: float | None = None         # бессрочный контракт, в процентах
+
+
 def fmt_price(price: float) -> str:
     """Красивый вывод числа: без экспоненты и без лишних нулей."""
     text = f"{price:.4f}" if abs(price) >= 1 else f"{price:.8f}"
@@ -80,3 +89,59 @@ async def validate_symbol(symbol: str, kind: str = "price") -> bool:
     if kind == "funding":
         return _f(items[0].get("fundingRate")) is not None
     return True
+
+
+async def get_spot_price(symbol: str) -> float | None:
+    """Текущая цена спот-пары или None, если пары нет / Bybit недоступен."""
+    try:
+        items = await _get_tickers("spot", symbol)
+    except Exception as e:
+        logger.debug("Нет спот-пары %s: %s", symbol, e)
+        return None
+    return _f(items[0].get("lastPrice")) if items else None
+
+
+async def resolve_symbol(raw: str, kind: str) -> tuple[str, float | None] | None:
+    """Подбирает тикер: сначала как ввёл пользователь, затем с добавлением USDT
+    (BTC -> BTCUSDT). Возвращает (тикер, текущая цена) или None."""
+    candidates = [raw]
+    if not raw.endswith(("USDT", "USDC")):
+        candidates.append(raw + "USDT")
+    for symbol in candidates:
+        if kind == "funding":
+            if await validate_symbol(symbol, "funding"):
+                return symbol, await get_spot_price(symbol)
+        else:
+            price = await get_spot_price(symbol)
+            if price is not None:
+                return symbol, price
+    return None
+
+
+async def get_symbol_info(symbol: str, kind: str = "price") -> SymbolInfo | None:
+    """Текущая цена и сопутствующие данные пары. None — пары нет или Bybit недоступен."""
+    category = "linear" if kind == "funding" else "spot"
+    try:
+        items = await _get_tickers(category, symbol)
+    except Exception as e:
+        logger.debug("Нет данных по %s (%s): %s", symbol, category, e)
+        return None
+    if not items:
+        return None
+
+    t = items[0]
+    price = _f(t.get("lastPrice"))
+    if price is None:
+        return None
+    if kind == "funding":
+        rate = _f(t.get("fundingRate"))
+        if rate is None:
+            return None
+        return SymbolInfo(price=price, funding=rate * 100)
+
+    change = _f(t.get("price24hPcnt"))
+    return SymbolInfo(
+        price=price,
+        change24h_pct=change * 100 if change is not None else None,
+        turnover24h=_f(t.get("turnover24h")),
+    )
